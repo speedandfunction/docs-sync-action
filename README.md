@@ -187,6 +187,9 @@ You can also run the synchronization script directly without GitHub Actions usin
 ```bash
 
 
+
+export OUTLINE_TOKEN="your-api-token"
+
 # One-line execution with parameters
 curl -sSL https://raw.githubusercontent.com/speedandfunction/docs-sync-action/main/docs-sync.sh | bash -s -- --outline-parent-document-id docs-folder-id ./docs
 
