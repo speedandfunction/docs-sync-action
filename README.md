@@ -26,30 +26,32 @@ A GitHub Action that automatically synchronizes markdown documentation with [Out
 Create or update your `.github/workflows/docs-sync.yml`:
 
 ```yaml
-name: Sync Documentation
+name: Sync Documentation to Outline Wiki
 
 on:
   push:
     branches: [ main ]
-    paths: [ 'docs/**' ]
+    paths:
+      - 'docs/**'
+      - '**.md'
   workflow_dispatch:
 
 jobs:
   sync-docs:
-    runs-on: ubuntu-latest
+    name: Synchronizes Documentation
+    runs-on: self-hosted
+    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Sync docs to Outline Wiki
-        uses: ./
-        with:
-          outline_url: 'https://your-wiki.getoutline.com/'
-          outline_token: ${{ secrets.OUTLINE_TOKEN }}
-          outline_parent_document_id: 'your-parent-document-id'
-          source_dir: './docs'
-          dry_run: 'false'
-          verbose: 'true'
+    - name: 'Sync documentation to Outline Wiki'
+      uses: speedandfunction/docs-sync-action@v1.0.0
+      with:
+        outline_token: ${{ secrets.OUTLINE_TOKEN }}
+        outline_parent_document_id: ${{ vars.OUTLINE_PARENT_DOCUMENT_ID }}
+        source_dir: './docs'
+        verbose: 'true'
 ```
 
 ### 2. Configure Secrets
