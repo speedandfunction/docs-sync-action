@@ -627,6 +627,17 @@ md_clean_content() {
     echo "$content"
 }
 
+md_replace_mermaid() {
+    local content="$1"
+    
+    # Replace ```mermaid with ```mermaidjs for Outline compatibility
+    # Use a more precise pattern to avoid double replacement
+    content=$(echo "$content" | sed 's/```mermaid$/```mermaidjs/g')
+    content=$(echo "$content" | sed 's/```mermaid\([[:space:]]\)/```mermaidjs\1/g')
+    
+    echo "$content"
+}
+
 md_process_content() {
     local file="$1"
     local title="$2"
@@ -635,6 +646,7 @@ md_process_content() {
     content=$(cat "$file")
 
     content=$(md_clean_content "$content" "$title")
+    content=$(md_replace_mermaid "$content")
 
     echo "$content"
 }
