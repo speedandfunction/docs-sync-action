@@ -1,0 +1,43 @@
+name: 'Docs Sync Action'
+description: 'Synchronize markdown documentation with Outline Wiki'
+inputs:
+  outline_url:
+    description: 'Outline Wiki base URL'
+    required: true
+    default: 'https://wiki.gluzdov.com/'
+  outline_token:
+    description: 'Outline Wiki API token'
+    required: true
+  outline_parent_document_id:
+    description: 'Outline Wiki parent document ID'
+    required: true
+  source_dir:
+    description: 'Source directory for markdown files'
+    required: false
+    default: './docs'
+  dry_run:
+    description: 'Run in dry-run mode'
+    required: false
+    default: 'false'
+  verbose:
+    description: 'Enable verbose logging'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Make entrypoint executable'
+      shell: bash
+      run: chmod +x ${{ github.action_path }}/doc-sync.sh
+
+    - name: 'Run docs sync'
+      shell: bash
+      run: ${{ github.action_path }}/doc-sync.sh
+      env:
+        OUTLINE_URL: ${{ inputs.outline_url }}
+        OUTLINE_TOKEN: ${{ inputs.outline_token }}
+        OUTLINE_PARENT_DOCUMENT_ID: ${{ inputs.outline_parent_document_id }}
+        SOURCE_DIR: ${{ inputs.source_dir }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        VERBOSE: ${{ inputs.verbose }}
