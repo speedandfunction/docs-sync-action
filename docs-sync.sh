@@ -659,6 +659,7 @@ md_process_content_with_links() {
     content=$(cat "$file")
 
     content=$(md_clean_content "$content" "$title")
+    content=$(md_replace_mermaid "$content")
     content=$(url_replace_links "$content")
 
     echo "$content"
