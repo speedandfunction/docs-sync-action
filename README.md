@@ -185,8 +185,10 @@ The action supports internal links between documents:
 You can also run the synchronization script directly without GitHub Actions using curl:
 
 ```bash
-# Download and execute the script directly
-curl -sSL https://raw.githubusercontent.com/speedandfunction/docs-sync-action/main/docs-sync.sh | bash
+
+
+# One-line execution with parameters
+curl -sSL https://raw.githubusercontent.com/speedandfunction/docs-sync-action/main/docs-sync.sh | bash -s -- --outline-parent-document-id docs-folder-id ./docs
 
 # Or with environment variables
 OUTLINE_URL="https://wiki.company.com/" \
