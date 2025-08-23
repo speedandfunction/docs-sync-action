@@ -1,0 +1,105 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Get version
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        release_name: Release ${{ steps.get_version.outputs.version }}
+        body: |
+          ## What's Changed
+          
+          ### Features
+          - Synchronize markdown documentation with Outline Wiki
+          - Support for hierarchical folder structure
+          - Automatic link replacement between documents
+          - Dry run mode for testing
+          - Verbose logging for debugging
+          
+          ### Usage
+          ```yaml
+          - name: Sync documentation
+            uses: speedandfunction/docs-sync-action@${{ steps.get_version.outputs.version }}
+            with:
+              outline_url: 'https://your-wiki.getoutline.com/'
+              outline_token: ${{ secrets.OUTLINE_TOKEN }}
+              outline_parent_document_id: 'your-parent-document-id'
+              source_dir: './docs'
+              dry_run: 'false'
+              verbose: 'true'
+          ```
+          
+          ### Alternative Usage with curl
+          ```bash
+          curl -sSL https://raw.githubusercontent.com/speedandfunction/docs-sync-action/${{ steps.get_version.outputs.version }}/docs-sync.sh | bash
+          ```
+          
+          ## Installation
+          See the [README](https://github.com/speedandfunction/docs-sync-action) for detailed installation and configuration instructions.
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ./docs-sync.sh
+        asset_name: docs-sync.sh
+        asset_content_type: application/x-sh
+
+    - name: Create Checksums
+      run: |
+        sha256sum docs-sync.sh > docs-sync.sh.sha256
+        sha512sum docs-sync.sh > docs-sync.sh.sha512
+
+    - name: Upload Checksums
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ./docs-sync.sh.sha256
+        asset_name: docs-sync.sh.sha256
+        asset_content_type: text/plain
+
+    - name: Upload SHA512 Checksum
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ./docs-sync.sh.sha512
+        asset_name: docs-sync.sh.sha512
+        asset_content_type: text/plain

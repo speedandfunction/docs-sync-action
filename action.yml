@@ -29,11 +29,11 @@ runs:
   steps:
     - name: 'Make entrypoint executable'
       shell: bash
-      run: chmod +x ${{ github.action_path }}/doc-sync.sh
+      run: chmod +x ${{ github.action_path }}/docs-sync.sh
 
     - name: 'Run docs sync'
       shell: bash
-      run: ${{ github.action_path }}/doc-sync.sh
+      run: ${{ github.action_path }}/docs-sync.sh
       env:
         OUTLINE_URL: ${{ inputs.outline_url }}
         OUTLINE_TOKEN: ${{ inputs.outline_token }}
