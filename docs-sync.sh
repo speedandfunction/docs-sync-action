@@ -4,6 +4,8 @@ declare -a URL_TITLES=()
 declare -a URL_URLS=()
 declare -a ATTACHMENT_CACHE_KEYS=()
 declare -a ATTACHMENT_CACHE_VALUES=()
+declare -a DOCUMENT_CACHE_KEYS=()
+declare -a DOCUMENT_CACHE_VALUES=()
 
 url_build_mapping_from_files() {
     log_verbose "Building URL mapping from file names..."
@@ -721,7 +723,18 @@ sync_document() {
     local title="$2"
     local content="$3"
 
-    log_verbose "  Checking if document exists: $title"
+    log_verbose "  Processing document: $title"
+
+    # Check if document content has changed using cache
+    local cached_doc_id
+    cached_doc_id=$(doc_cache_check "$file")
+    
+    if [[ -n "$cached_doc_id" ]]; then
+        log_verbose "  Document unchanged, skipping update: $title (ID: $cached_doc_id)"
+        return 0
+    fi
+
+    log_verbose "  Document changed or not cached, proceeding with sync: $title"
 
     local parent_uuid
     parent_uuid=$(process_folder_structure "$file")
@@ -740,10 +753,18 @@ sync_document() {
 
     if [[ -n "$doc_id" ]]; then
         log_verbose "  Document exists (ID: $doc_id), updating..."
-        api_update_document "$doc_id" "$content"
+        if api_update_document "$doc_id" "$content"; then
+            # Add to cache after successful update
+            doc_cache_add "$file" "$doc_id"
+        fi
     else
         log_verbose "  Document not found, creating new in parent: $parent_uuid..."
-        api_create_document_in_parent "$title" "$content" "$parent_uuid"
+        local new_doc_id
+        new_doc_id=$(api_create_document_in_parent "$title" "$content" "$parent_uuid")
+        if [[ -n "$new_doc_id" ]]; then
+            # Add to cache after successful creation
+            doc_cache_add "$file" "$new_doc_id"
+        fi
     fi
 }
 
@@ -774,7 +795,111 @@ process_files() {
 
 
 # =============================================================================
-# Check if file is already in cache
+# ATTACHMENT CACHE FUNCTIONS (HYBRID: MEMORY + FILE)
+# =============================================================================
+
+# Initialize attachment cache from file
+att_cache_init() {
+    local cache_file="${SOURCE_DIR}/.attachment_cache"
+    
+    log_verbose "Initializing attachment cache from: $cache_file"
+    
+    # Initialize memory arrays if not already done
+    ATTACHMENT_CACHE_KEYS=()
+    ATTACHMENT_CACHE_VALUES=()
+    
+    # Check if cache file exists
+    if [[ ! -f "$cache_file" ]]; then
+        log_verbose "No cache file found, starting with empty cache"
+        return 0
+    fi
+    
+    # Check if cache file is readable
+    if [[ ! -r "$cache_file" ]]; then
+        log_warning "Cache file exists but is not readable: $cache_file"
+        return 0
+    fi
+    
+    local line_count=0
+    local loaded_count=0
+    
+    # Read cache file line by line
+    while IFS='|' read -r hash url; do
+        line_count=$((line_count + 1))
+        
+        # Skip empty lines and comments
+        [[ -z "$hash" ]] && continue
+        [[ "$hash" =~ ^#.* ]] && continue
+        
+        # Validate hash format (MD5 should be 32 hex characters)
+        if [[ ! "$hash" =~ ^[a-f0-9]{32}$ ]]; then
+            log_warning "Invalid hash format in cache file line $line_count: $hash"
+            continue
+        fi
+        
+        # Validate URL format
+        if [[ -z "$url" || ! "$url" =~ ^https?:// ]]; then
+            log_warning "Invalid URL format in cache file line $line_count: $url"
+            continue
+        fi
+        
+        # Add to memory cache
+        ATTACHMENT_CACHE_KEYS+=("$hash")
+        ATTACHMENT_CACHE_VALUES+=("$url")
+        loaded_count=$((loaded_count + 1))
+        
+    done < "$cache_file"
+    
+    log_verbose "Loaded $loaded_count cache entries from $line_count lines"
+    
+    if [[ $loaded_count -gt 0 ]]; then
+        log_info "📋 Loaded $loaded_count cached attachments from previous runs"
+    fi
+}
+
+# Get cache file path
+att_cache_get_file_path() {
+    echo "${SOURCE_DIR}/.attachment_cache"
+}
+
+# Add entry to cache file
+att_cache_save_to_file() {
+    local file_hash="$1"
+    local remote_url="$2"
+    local cache_file
+    cache_file=$(att_cache_get_file_path)
+    
+    # In dry-run mode, don't write to file
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_verbose "[DRY RUN] Would save to cache file: $file_hash -> $remote_url"
+        return 0
+    fi
+    
+    # Ensure cache file exists and is writable
+    if [[ ! -f "$cache_file" ]]; then
+        if ! touch "$cache_file" 2>/dev/null; then
+            log_warning "Cannot create cache file: $cache_file"
+            return 1
+        fi
+    fi
+    
+    if [[ ! -w "$cache_file" ]]; then
+        log_warning "Cache file is not writable: $cache_file"
+        return 1
+    fi
+    
+    # Append to cache file
+    if echo "$file_hash|$remote_url" >> "$cache_file" 2>/dev/null; then
+        log_verbose "Saved to cache file: $file_hash -> $remote_url"
+        return 0
+    else
+        log_warning "Failed to write to cache file: $cache_file"
+        return 1
+    fi
+}
+
+# =============================================================================
+# Check if file is already in cache (ENHANCED with file cache support)
 att_cache_check() {
     local file_path="$1"
     
@@ -785,17 +910,49 @@ att_cache_check() {
     local file_hash
     file_hash=$(md5sum "$file_path" 2>/dev/null | cut -d' ' -f1)
     
+    if [[ -z "$file_hash" ]]; then
+        log_warning "Failed to calculate hash for file: $file_path"
+        return 1
+    fi
+    
+    # Step 1: Check memory cache first (fastest)
     for i in "${!ATTACHMENT_CACHE_KEYS[@]}"; do
         if [[ "${ATTACHMENT_CACHE_KEYS[$i]}" == "$file_hash" ]]; then
+            log_verbose "Cache HIT (memory): $file_hash -> ${ATTACHMENT_CACHE_VALUES[$i]}"
             echo "${ATTACHMENT_CACHE_VALUES[$i]}"
             return 0
         fi
     done
     
+    # Step 2: Check file cache if not found in memory
+    local cache_file
+    cache_file=$(att_cache_get_file_path)
+    
+    if [[ -f "$cache_file" && -r "$cache_file" ]]; then
+        local cached_url
+        # Search for hash in file cache
+        while IFS='|' read -r hash url; do
+            # Skip empty lines and comments
+            [[ -z "$hash" ]] && continue
+            [[ "$hash" =~ ^#.* ]] && continue
+            
+            if [[ "$hash" == "$file_hash" ]]; then
+                # Found in file cache - add to memory cache for future speed
+                ATTACHMENT_CACHE_KEYS+=("$file_hash")
+                ATTACHMENT_CACHE_VALUES+=("$url")
+                log_verbose "Cache HIT (file->memory): $file_hash -> $url"
+                echo "$url"
+                return 0
+            fi
+        done < "$cache_file"
+    fi
+    
+    # Step 3: Not found in either cache
+    log_verbose "Cache MISS: $file_hash"
     return 1
 }
 
-# Add file to cache
+# Add file to cache (ENHANCED with file cache persistence)
 att_cache_add() {
     local file_path="$1"
     local remote_url="$2"
@@ -808,14 +965,237 @@ att_cache_add() {
     local file_hash
     file_hash=$(md5sum "$file_path" 2>/dev/null | cut -d' ' -f1)
     
-    if [[ -n "$file_hash" && -n "$remote_url" ]]; then
-        ATTACHMENT_CACHE_KEYS+=("$file_hash")
-        ATTACHMENT_CACHE_VALUES+=("$remote_url")
-        log_verbose "Added to attachment cache: $file_hash -> $remote_url"
-    else
-        log_error "Failed to add to attachment cache: invalid hash or URL"
+    if [[ -z "$file_hash" ]]; then
+        log_error "Failed to calculate hash for file: $file_path"
         return 1
     fi
+    
+    if [[ -z "$remote_url" ]]; then
+        log_error "Cannot add to cache: empty URL for file: $file_path"
+        return 1
+    fi
+    
+    # Check if already in memory cache (avoid duplicates)
+    for i in "${!ATTACHMENT_CACHE_KEYS[@]}"; do
+        if [[ "${ATTACHMENT_CACHE_KEYS[$i]}" == "$file_hash" ]]; then
+            log_verbose "File already in memory cache: $file_hash"
+            return 0
+        fi
+    done
+    
+    # Add to memory cache
+    ATTACHMENT_CACHE_KEYS+=("$file_hash")
+    ATTACHMENT_CACHE_VALUES+=("$remote_url")
+    
+    # Save to file cache for persistence across runs
+    if att_cache_save_to_file "$file_hash" "$remote_url"; then
+        log_verbose "Added to hybrid cache (memory+file): $file_hash -> $remote_url"
+    else
+        log_verbose "Added to memory cache only: $file_hash -> $remote_url"
+    fi
+    
+    return 0
+}
+
+# =============================================================================
+# DOCUMENT CACHE FUNCTIONS (HYBRID: MEMORY + FILE)
+# =============================================================================
+
+# Initialize document cache from file
+doc_cache_init() {
+    local cache_file="${SOURCE_DIR}/.document_cache"
+    
+    log_verbose "Initializing document cache from: $cache_file"
+    
+    # Initialize memory arrays if not already done
+    DOCUMENT_CACHE_KEYS=()
+    DOCUMENT_CACHE_VALUES=()
+    
+    # Check if cache file exists
+    if [[ ! -f "$cache_file" ]]; then
+        log_verbose "No document cache file found, starting with empty cache"
+        return 0
+    fi
+    
+    # Check if cache file is readable
+    if [[ ! -r "$cache_file" ]]; then
+        log_warning "Document cache file exists but is not readable: $cache_file"
+        return 0
+    fi
+    
+    local line_count=0
+    local loaded_count=0
+    
+    # Read cache file line by line
+    while IFS='|' read -r hash doc_id; do
+        line_count=$((line_count + 1))
+        
+        # Skip empty lines and comments
+        [[ -z "$hash" ]] && continue
+        [[ "$hash" =~ ^#.* ]] && continue
+        
+        # Validate hash format (MD5 should be 32 hex characters)
+        if [[ ! "$hash" =~ ^[a-f0-9]{32}$ ]]; then
+            log_warning "Invalid hash format in document cache file line $line_count: $hash"
+            continue
+        fi
+        
+        # Validate document ID format (should be UUID or non-empty string)
+        if [[ -z "$doc_id" ]]; then
+            log_warning "Invalid document ID in cache file line $line_count: $doc_id"
+            continue
+        fi
+        
+        # Add to memory cache
+        DOCUMENT_CACHE_KEYS+=("$hash")
+        DOCUMENT_CACHE_VALUES+=("$doc_id")
+        loaded_count=$((loaded_count + 1))
+        
+    done < "$cache_file"
+    
+    log_verbose "Loaded $loaded_count document cache entries from $line_count lines"
+    
+    if [[ $loaded_count -gt 0 ]]; then
+        log_info "📋 Loaded $loaded_count cached documents from previous runs"
+    fi
+}
+
+# Get document cache file path
+doc_cache_get_file_path() {
+    echo "${SOURCE_DIR}/.document_cache"
+}
+
+# Add entry to document cache file
+doc_cache_save_to_file() {
+    local file_hash="$1"
+    local doc_id="$2"
+    local cache_file
+    cache_file=$(doc_cache_get_file_path)
+    
+    # In dry-run mode, don't write to file
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_verbose "[DRY RUN] Would save to document cache file: $file_hash -> $doc_id"
+        return 0
+    fi
+    
+    # Ensure cache file exists and is writable
+    if [[ ! -f "$cache_file" ]]; then
+        if ! touch "$cache_file" 2>/dev/null; then
+            log_warning "Cannot create document cache file: $cache_file"
+            return 1
+        fi
+    fi
+    
+    if [[ ! -w "$cache_file" ]]; then
+        log_warning "Document cache file is not writable: $cache_file"
+        return 1
+    fi
+    
+    # Append to cache file
+    if echo "$file_hash|$doc_id" >> "$cache_file" 2>/dev/null; then
+        log_verbose "Saved to document cache file: $file_hash -> $doc_id"
+        return 0
+    else
+        log_warning "Failed to write to document cache file: $cache_file"
+        return 1
+    fi
+}
+
+# Check if document is already in cache (ENHANCED with file cache support)
+doc_cache_check() {
+    local file_path="$1"
+    
+    if [[ ! -f "$file_path" ]]; then
+        return 1
+    fi
+    
+    local file_hash
+    file_hash=$(md5sum "$file_path" 2>/dev/null | cut -d' ' -f1)
+    
+    if [[ -z "$file_hash" ]]; then
+        log_warning "Failed to calculate hash for document: $file_path"
+        return 1
+    fi
+    
+    # Step 1: Check memory cache first (fastest)
+    for i in "${!DOCUMENT_CACHE_KEYS[@]}"; do
+        if [[ "${DOCUMENT_CACHE_KEYS[$i]}" == "$file_hash" ]]; then
+            log_verbose "Document cache HIT (memory): $file_hash -> ${DOCUMENT_CACHE_VALUES[$i]}"
+            echo "${DOCUMENT_CACHE_VALUES[$i]}"
+            return 0
+        fi
+    done
+    
+    # Step 2: Check file cache if not found in memory
+    local cache_file
+    cache_file=$(doc_cache_get_file_path)
+    
+    if [[ -f "$cache_file" && -r "$cache_file" ]]; then
+        # Search for hash in file cache
+        while IFS='|' read -r hash doc_id; do
+            # Skip empty lines and comments
+            [[ -z "$hash" ]] && continue
+            [[ "$hash" =~ ^#.* ]] && continue
+            
+            if [[ "$hash" == "$file_hash" ]]; then
+                # Found in file cache - add to memory cache for future speed
+                DOCUMENT_CACHE_KEYS+=("$file_hash")
+                DOCUMENT_CACHE_VALUES+=("$doc_id")
+                log_verbose "Document cache HIT (file->memory): $file_hash -> $doc_id"
+                echo "$doc_id"
+                return 0
+            fi
+        done < "$cache_file"
+    fi
+    
+    # Step 3: Not found in either cache
+    log_verbose "Document cache MISS: $file_hash"
+    return 1
+}
+
+# Add document to cache (ENHANCED with file cache persistence)
+doc_cache_add() {
+    local file_path="$1"
+    local doc_id="$2"
+    
+    if [[ ! -f "$file_path" ]]; then
+        log_error "Cannot add non-existent document to cache: $file_path"
+        return 1
+    fi
+    
+    local file_hash
+    file_hash=$(md5sum "$file_path" 2>/dev/null | cut -d' ' -f1)
+    
+    if [[ -z "$file_hash" ]]; then
+        log_error "Failed to calculate hash for document: $file_path"
+        return 1
+    fi
+    
+    if [[ -z "$doc_id" ]]; then
+        log_error "Cannot add to document cache: empty document ID for file: $file_path"
+        return 1
+    fi
+    
+    # Check if already in memory cache (avoid duplicates)
+    for i in "${!DOCUMENT_CACHE_KEYS[@]}"; do
+        if [[ "${DOCUMENT_CACHE_KEYS[$i]}" == "$file_hash" ]]; then
+            log_verbose "Document already in memory cache: $file_hash"
+            return 0
+        fi
+    done
+    
+    # Add to memory cache
+    DOCUMENT_CACHE_KEYS+=("$file_hash")
+    DOCUMENT_CACHE_VALUES+=("$doc_id")
+    
+    # Save to file cache for persistence across runs
+    if doc_cache_save_to_file "$file_hash" "$doc_id"; then
+        log_verbose "Added to hybrid document cache (memory+file): $file_hash -> $doc_id"
+    else
+        log_verbose "Added to memory document cache only: $file_hash -> $doc_id"
+    fi
+    
+    return 0
 }
 
 # Find all attachment references in markdown content
@@ -1122,21 +1502,17 @@ att_process_attachments_in_content() {
                 local alt_text
                 alt_text=$(echo "$image_link" | sed -n 's/.*!\[\([^]]*\)\].*/\1/p')
 
-                # Debug output to understand why replacement is not working
-                # Use Python3 for robust string replacement that handles special characters
-                if command -v python3 >/dev/null 2>&1; then
-                    if [[ -n "$alt_text" ]]; then
-                        processed_content=$(python3 -c "import sys; content=sys.stdin.read(); old=r'$image_link'; new=r'![$alt_text]($final_url)'; print(content.replace(old, new), end='')" <<< "$processed_content")
-                    else
-                        processed_content=$(python3 -c "import sys; content=sys.stdin.read(); old=r'$image_link'; new=r'![Image]($final_url)'; print(content.replace(old, new), end='')" <<< "$processed_content")
-                    fi
+                # Replace attachment link with external URL using sed for robust handling
+                # Escape special characters in the image_link for sed
+                local escaped_image_link
+                escaped_image_link=$(printf '%s\n' "$image_link" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                
+                if [[ -n "$alt_text" ]]; then
+                    local new_link="![$alt_text]($final_url)"
+                    processed_content=$(printf '%s\n' "$processed_content" | sed "s|$escaped_image_link|$new_link|g")
                 else
-                    # Fall back to bash (may not work with special chars)
-                    if [[ -n "$alt_text" ]]; then
-                        processed_content="${processed_content//$image_link/![$alt_text]($final_url)}"
-                    else
-                        processed_content="${processed_content//$image_link/![Image]($final_url)}"
-                    fi
+                    local new_link="![Image]($final_url)"
+                    processed_content=$(printf '%s\n' "$processed_content" | sed "s|$escaped_image_link|$new_link|g")
                 fi                
                 log_verbose "Replaced attachment: $image_link -> $final_url"
             else
@@ -1200,6 +1576,12 @@ main() {
 
     cfg_load "$@"
     cfg_validate
+
+    # Initialize hybrid attachment cache (memory + file)
+    att_cache_init
+
+    # Initialize hybrid document cache (memory + file)
+    doc_cache_init
 
     api_test_connection
 
