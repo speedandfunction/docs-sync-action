@@ -710,6 +710,10 @@ process_single_file() {
 
     local result
     result=$(sync_document "$file" "$title" "$content")
+    
+    # Add delay between files to avoid rate limiting
+    log_verbose "  Adding 2 second delay between files to respect rate limits..."
+    sleep 2
 }
 
 sync_document() {
@@ -728,7 +732,7 @@ sync_document() {
     doc_id=$(api_find_document_by_title_in_parent "$title" "$parent_uuid")
 
     # Validate that all local attachment links have been replaced
-    if ! att_validate_content_replacement "$content" "$(dirname "$file")"; then
+    if ! att_validate_content_replacement "ose" "$(dirname "$file")"; then
         log_error "Attachment replacement validation failed for document: $title"
         log_error "Document will not be saved due to validation failure"
         return 1
@@ -736,11 +740,9 @@ sync_document() {
 
     if [[ -n "$doc_id" ]]; then
         log_verbose "  Document exists (ID: $doc_id), updating..."
-        log_verbose "  Content to save: $content"
         api_update_document "$doc_id" "$content"
     else
         log_verbose "  Document not found, creating new in parent: $parent_uuid..."
-        log_verbose "  Content to save: $content"
         api_create_document_in_parent "$title" "$content" "$parent_uuid"
     fi
 }
@@ -876,6 +878,7 @@ att_validate_attachment_file() {
 }
 
 # Create attachment via Outline API
+# Create attachment via Outline API with exponential backoff
 api_create_attachment() {
     local file_path="$1"
     local filename="$2"
@@ -892,42 +895,59 @@ api_create_attachment() {
     file_size=$(stat -f%z "$file_path" 2>/dev/null || stat -c%s "$file_path" 2>/dev/null || echo "0")
     contentType="$(file -b --mime-type "$file_path" 2>/dev/null || echo "application/octet-stream")"
     
-    local response
-    response=$(curl -sS "${OUTLINE_URL%/}/api/attachments.create" \
-        --request POST \
-        --header 'Content-Type: application/json' \
-        --header "Authorization: Bearer ${OUTLINE_TOKEN}" \
-        --data "{
-            \"name\": \"${filename}\",
-            \"contentType\": \"${contentType}\",
-            \"size\": ${file_size}
-        }"
-    );
-
-    if ! echo "$response" | jq empty 2>/dev/null; then
-        log_error "Invalid JSON response from attachment API: $response" 
-        return 1
-    fi
-
-    log_verbose "!!! DATA: ${response}"
+    # Exponential backoff for rate limit handling
+    local retry_count=0
+    local max_retries=3
+    local base_delay=30  # 30 seconds base delay for 30, 60, 120 second intervals
     
-    local upload_url
-    local attachment_url
-    local form_data
-    upload_url=$(echo "$response" | jq -r '.data.uploadUrl // empty' 2>/dev/null)
-    attachment_url=$(echo "$response" | jq -r '.data.attachment.url // empty' 2>/dev/null)
-    form_data=$(echo "$response" | jq -c '.data.form // empty' 2>/dev/null)
-    
-    if [[ -n "$upload_url" && -n "$attachment_url" && -n "$form_data" ]]; then
-        echo "${upload_url}|${attachment_url}|${form_data}"
-        return 0
-    else
-        log_error "API Response: $response"
-        return 1
-    fi
+    while [[ $retry_count -le $max_retries ]]; do
+        local response
+        response=$(curl -sS "${OUTLINE_URL%/}/api/attachments.create" --request POST --header "Content-Type: application/json" --header "Authorization: Bearer ${OUTLINE_TOKEN}" --data "{\"name\": \"${filename}\", \"contentType\": \"${contentType}\", \"size\": ${file_size}}")
+
+        if ! echo "$response" | jq empty 2>/dev/null; then
+            log_error "Invalid JSON response from attachment API: $response" 
+            return 1
+        fi
+        
+        # Check for rate limit error
+        local status
+        local error
+        status=$(echo "$response" | jq -r ".status // empty" 2>/dev/null)
+        error=$(echo "$response" | jq -r ".error // empty" 2>/dev/null)
+        
+        if [[ "$status" == "429" && "$error" == "rate_limit_exceeded" ]]; then
+            if [[ $retry_count -lt $max_retries ]]; then
+                local delay=$((base_delay * (2 ** retry_count)))
+                log_verbose "Rate limit exceeded, waiting ${delay} seconds before retry $((retry_count + 1))/$max_retries..."
+                sleep $delay
+                ((retry_count++))
+                continue
+            else
+                log_error "Max retries exceeded for rate limit"
+                log_error "API Response: $response"
+                return 1
+            fi
+        fi
+        
+        # If not rate limit error, process the response
+        local upload_url
+        local attachment_url
+        local form_data
+        upload_url=$(echo "$response" | jq -r ".data.uploadUrl // empty" 2>/dev/null)
+        attachment_url=$(echo "$response" | jq -r ".data.attachment.url // empty" 2>/dev/null)
+        form_data=$(echo "$response" | jq -c ".data.form // empty" 2>/dev/null)
+        
+        if [[ -n "$upload_url" && -n "$attachment_url" && -n "$form_data" ]]; then
+            sleep 1
+            echo "${upload_url}|${attachment_url}|${form_data}"
+            return 0
+        else
+            log_error "API Response: $response"
+            return 1
+        fi
+    done
 }
 
-# Upload file to signed URL
 api_upload_attachment_file() {
     local file_path="$1"
     local upload_url="$2"
@@ -1124,7 +1144,6 @@ att_process_attachments_in_content() {
             fi
         fi
     done <<< "$attachments"
-
     
     echo "$processed_content"
 }
