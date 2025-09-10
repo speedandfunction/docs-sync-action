@@ -2,7 +2,9 @@
 
 declare -a URL_TITLES=()
 declare -a URL_URLS=()
-REPLACE_LINKS="false"
+declare -a ATTACHMENT_CACHE_KEYS=()
+declare -a ATTACHMENT_CACHE_VALUES=()
+
 url_build_mapping_from_files() {
     log_verbose "Building URL mapping from file names..."
 
@@ -661,7 +663,9 @@ md_process_content_with_links() {
     content=$(md_clean_content "$content" "$title")
     content=$(md_replace_mermaid "$content")
     content=$(url_replace_links "$content")
-
+    
+    content=$(att_process_attachments_in_content "$content" "$(dirname "$file")")
+    
     echo "$content"
 }
 log_info() {
@@ -699,11 +703,7 @@ process_single_file() {
     log_verbose "Processing file: $file"
 
     title=$(md_extract_title "$file")
-    if [[ "$REPLACE_LINKS" == "true" ]]; then
-        content=$(md_process_content_with_links "$file" "$title")
-    else
-        content=$(md_process_content "$file" "$title")
-    fi
+    content=$(md_process_content_with_links "$file" "$title")
 
     log_verbose "  Title: $title"
     log_verbose "  Content length: ${#content} characters"
@@ -727,11 +727,20 @@ sync_document() {
     local doc_id
     doc_id=$(api_find_document_by_title_in_parent "$title" "$parent_uuid")
 
+    # Validate that all local attachment links have been replaced
+    if ! att_validate_content_replacement "$content" "$(dirname "$file")"; then
+        log_error "Attachment replacement validation failed for document: $title"
+        log_error "Document will not be saved due to validation failure"
+        return 1
+    fi
+
     if [[ -n "$doc_id" ]]; then
         log_verbose "  Document exists (ID: $doc_id), updating..."
+        log_verbose "  Content to save: $content"
         api_update_document "$doc_id" "$content"
     else
         log_verbose "  Document not found, creating new in parent: $parent_uuid..."
+        log_verbose "  Content to save: $content"
         api_create_document_in_parent "$title" "$content" "$parent_uuid"
     fi
 }
@@ -761,6 +770,405 @@ process_files() {
     log_verbose "Processed $processed_count of $file_count files"
 }
 
+
+# =============================================================================
+# Check if file is already in cache
+att_cache_check() {
+    local file_path="$1"
+    
+    if [[ ! -f "$file_path" ]]; then
+        return 1
+    fi
+    
+    local file_hash
+    file_hash=$(md5sum "$file_path" 2>/dev/null | cut -d' ' -f1)
+    
+    for i in "${!ATTACHMENT_CACHE_KEYS[@]}"; do
+        if [[ "${ATTACHMENT_CACHE_KEYS[$i]}" == "$file_hash" ]]; then
+            echo "${ATTACHMENT_CACHE_VALUES[$i]}"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Add file to cache
+att_cache_add() {
+    local file_path="$1"
+    local remote_url="$2"
+    
+    if [[ ! -f "$file_path" ]]; then
+        log_error "Cannot add non-existent file to cache: $file_path"
+        return 1
+    fi
+    
+    local file_hash
+    file_hash=$(md5sum "$file_path" 2>/dev/null | cut -d' ' -f1)
+    
+    if [[ -n "$file_hash" && -n "$remote_url" ]]; then
+        ATTACHMENT_CACHE_KEYS+=("$file_hash")
+        ATTACHMENT_CACHE_VALUES+=("$remote_url")
+        log_verbose "Added to attachment cache: $file_hash -> $remote_url"
+    else
+        log_error "Failed to add to attachment cache: invalid hash or URL"
+        return 1
+    fi
+}
+
+# Find all attachment references in markdown content
+att_find_attachments_in_content() {
+    local content="$1"
+    
+    # Extract all image links that reference attachments directory
+    # Handle both simple links and links with title attributes
+    echo "$content" | grep -o '!\[.*\](.*attachments/.*)' 2>/dev/null || true
+}
+
+# Extract file path from markdown image link
+att_extract_file_path() {
+    local image_link="$1"
+    echo "$image_link" | sed -E 's/.*]\(([^)]*)\).*/\1/' | sed -E 's/\s*"[^"]*"$//' | sed 's/[[:space:]]*$//'
+}
+
+# Resolve relative attachment path to absolute path
+att_resolve_attachment_path() {
+    local relative_path="$1"
+    local source_dir="$2"
+    
+    # Remove any quotes or size specifications
+    relative_path=$(echo "$relative_path" | sed -E 's/^["'\'']|["'\'']$//g' | sed -E 's/\s*=.*$//')
+    
+    if [[ "$relative_path" = /* ]]; then
+        # Already absolute path
+        echo "$relative_path"
+    else
+        # Make relative to source directory
+        echo "$source_dir/$relative_path"
+    fi
+}
+
+# Validate attachment file exists and is readable
+att_validate_attachment_file() {
+    local file_path="$1"
+    
+    if [[ ! -f "$file_path" ]]; then
+        log_warning "Attachment file not found: $file_path"
+        return 1
+    fi
+    
+    if [[ ! -r "$file_path" ]]; then
+        log_error "Attachment file not readable: $file_path"
+        return 1
+    fi
+    
+    # Check file size (Outline has limits)
+    local file_size
+    file_size=$(stat -f%z "$file_path" 2>/dev/null || stat -c%s "$file_path" 2>/dev/null || echo "0")
+    
+    if [[ "$file_size" -gt 26214400 ]]; then  # 25MB limit
+        log_error "Attachment file too large (>25MB): $file_path"
+        return 1
+    fi
+    
+    log_verbose "Attachment file validated: $file_path ($file_size bytes)"
+    return 0
+}
+
+# Create attachment via Outline API
+api_create_attachment() {
+    local file_path="$1"
+    local filename="$2"
+    
+    log_verbose "Creating attachment via API: $filename"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN: Would create attachment: $filename"
+        echo "https://example.com/attachments/dry-run-$filename"
+        return 0
+    fi
+    
+    local file_size
+    file_size=$(stat -f%z "$file_path" 2>/dev/null || stat -c%s "$file_path" 2>/dev/null || echo "0")
+    contentType="$(file -b --mime-type "$file_path" 2>/dev/null || echo "application/octet-stream")"
+    
+    local response
+    response=$(curl -sS "${OUTLINE_URL%/}/api/attachments.create" \
+        --request POST \
+        --header 'Content-Type: application/json' \
+        --header "Authorization: Bearer ${OUTLINE_TOKEN}" \
+        --data "{
+            \"name\": \"${filename}\",
+            \"contentType\": \"${contentType}\",
+            \"size\": ${file_size}
+        }"
+    );
+
+    if ! echo "$response" | jq empty 2>/dev/null; then
+        log_error "Invalid JSON response from attachment API: $response" 
+        return 1
+    fi
+
+    log_verbose "!!! DATA: ${response}"
+    
+    local upload_url
+    local attachment_url
+    local form_data
+    upload_url=$(echo "$response" | jq -r '.data.uploadUrl // empty' 2>/dev/null)
+    attachment_url=$(echo "$response" | jq -r '.data.attachment.url // empty' 2>/dev/null)
+    form_data=$(echo "$response" | jq -c '.data.form // empty' 2>/dev/null)
+    
+    if [[ -n "$upload_url" && -n "$attachment_url" && -n "$form_data" ]]; then
+        echo "${upload_url}|${attachment_url}|${form_data}"
+        return 0
+    else
+        log_error "API Response: $response"
+        return 1
+    fi
+}
+
+# Upload file to signed URL
+api_upload_attachment_file() {
+    local file_path="$1"
+    local upload_url="$2"
+    local form_data="$3"
+
+    log_verbose "Upload URL: ${upload_url}"
+    log_verbose "File Path: ${file_path}"
+    
+    log_verbose "Uploading file to signed URL: ${file_path}"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN: Would upload file: $file_path"
+        return 0
+    fi
+
+    # Try POST approach with correct presigned POST URL usage
+    log_verbose "Using POST approach with correct presigned POST URL usage"
+    
+    # Extract individual fields from form_data
+    local key_value=$(echo "$form_data" | jq -r '.key // empty' 2>/dev/null)
+    local policy_value=$(echo "$form_data" | jq -r '.Policy // empty' 2>/dev/null)
+    local x_amz_algorithm=$(echo "$form_data" | jq -r '."X-Amz-Algorithm" // empty' 2>/dev/null)
+    local x_amz_credential=$(echo "$form_data" | jq -r '."X-Amz-Credential" // empty' 2>/dev/null)
+    local x_amz_date=$(echo "$form_data" | jq -r '."X-Amz-Date" // empty' 2>/dev/null)
+    local x_amz_signature=$(echo "$form_data" | jq -r '."X-Amz-Signature" // empty' 2>/dev/null)
+    local x_amz_security_token=$(echo "$form_data" | jq -r '."X-Amz-Security-Token" // empty' 2>/dev/null)
+    local cache_control=$(echo "$form_data" | jq -r '."Cache-Control" // empty' 2>/dev/null)
+    local content_type=$(echo "$form_data" | jq -r '."Content-Type" // empty' 2>/dev/null)
+    local content_disposition=$(echo "$form_data" | jq -r '."Content-Disposition" // empty' 2>/dev/null)
+    local acl=$(echo "$form_data" | jq -r '.acl // empty' 2>/dev/null)
+    local bucket=$(echo "$form_data" | jq -r '.bucket // empty' 2>/dev/null)
+    
+    # Build curl command with correct presigned POST approach
+    local response
+    response=$(curl -sS -X POST "${upload_url}" \
+        --form-string "key=${key_value}" \
+        --form-string "Policy=${policy_value}" \
+        --form-string "X-Amz-Algorithm=${x_amz_algorithm}" \
+        --form-string "X-Amz-Credential=${x_amz_credential}" \
+        --form-string "X-Amz-Date=${x_amz_date}" \
+        --form-string "X-Amz-Signature=${x_amz_signature}" \
+        --form-string "X-Amz-Security-Token=${x_amz_security_token}" \
+        --form-string "Cache-Control=${cache_control}" \
+        --form-string "Content-Type=${content_type}" \
+        --form-string "Content-Disposition=${content_disposition}" \
+        --form-string "acl=${acl}" \
+        --form-string "bucket=${bucket}" \
+        --form "file=@${file_path}")
+    
+    log_verbose "Response: $response"
+    
+    if [[ $? -eq 0 ]]; then
+        log_verbose "File uploaded successfully: $file_path"
+        return 0
+    else
+        log_error "Failed to upload file: $file_path"
+        log_error "Response: $response"
+        return 1
+    fi
+}
+
+# Get final attachment URL from Outline
+att_get_attachment_url() {
+    local filename="$1"
+    
+    log_verbose "Getting final attachment URL for: $filename"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "https://example.com/attachments/dry-run-$filename"
+        return 0
+    fi
+    
+    # For now, we'll construct the URL based on the filename
+    # In a real implementation, you might need to query the API for the final URL
+    echo "${OUTLINE_URL%/}/api/attachments/$filename"
+}
+
+# Process all attachments in content
+att_process_attachments_in_content() {
+    local content="$1"
+    local source_dir="$2"
+    local processed_content="$content"
+    
+    log_verbose "Processing attachments in content"
+    
+    # Find all attachment references
+    local attachments
+    attachments=$(att_find_attachments_in_content "$content")
+    
+    if [[ -z "$attachments" ]]; then
+        log_verbose "No attachments found in content"
+        echo "$processed_content"
+        return 0
+    fi
+    
+    # Process each attachment
+    while IFS= read -r image_link; do
+        if [[ -n "$image_link" ]]; then
+            log_verbose "Processing attachment: $image_link"
+            
+            # Extract file path
+            local relative_path
+            relative_path=$(att_extract_file_path "$image_link")
+            
+            if [[ -z "$relative_path" ]]; then
+                log_warning "Could not extract path from image link: $image_link"
+                continue
+            fi
+            
+            # Resolve to absolute path
+            local absolute_path
+            absolute_path=$(att_resolve_attachment_path "$relative_path" "$source_dir")
+            
+            # Check cache first
+            local cached_url
+            cached_url=$(att_cache_check "$absolute_path")
+            
+            if [[ -n "$cached_url" ]]; then
+                log_verbose "Using cached attachment: $absolute_path -> $cached_url"
+                local alt_text
+                alt_text=$(echo "$image_link" | sed -n 's/.*!\[\([^]]*\)\].*/\1/p')
+                if [[ -n "$alt_text" ]]; then
+                    processed_content="${processed_content//$image_link/![$alt_text]($cached_url)}"
+                else
+                    processed_content="${processed_content//$image_link/![Image]($cached_url)}"
+                fi
+                continue
+            fi
+            
+            # Validate file
+            if ! att_validate_attachment_file "$absolute_path"; then
+                log_warning "Skipping invalid attachment: $absolute_path"
+                continue
+            fi
+            
+            # Get filename
+            local filename
+            filename=$(basename "$absolute_path")
+            
+            # Create attachment via API
+            local api_result
+            api_result=$(api_create_attachment "$absolute_path" "$filename")
+            
+            if [[ -z "$api_result" ]]; then
+                log_error "Failed to create attachment: $filename"
+                continue
+            fi
+            
+            # Split the result into upload_url, attachment_url, and form_data
+            local upload_url
+            local attachment_url
+            local form_data
+            upload_url=$(echo "$api_result" | cut -d'|' -f1)
+            attachment_url=$(echo "$api_result" | cut -d'|' -f2)
+            form_data=$(echo "$api_result" | cut -d'|' -f3)
+            
+            # Upload file
+            if ! api_upload_attachment_file "$absolute_path" "$upload_url" "$form_data"; then
+                log_error "Failed to upload attachment: $filename"
+                continue
+            fi
+            
+            # Use the attachment URL from API response
+            local final_url
+            final_url="${OUTLINE_URL%/}${attachment_url}"
+            
+            if [[ -n "$final_url" ]]; then
+                # Add to cache
+                att_cache_add "$absolute_path" "$final_url"
+                
+                # Replace in content - preserve original alt text and title
+                local alt_text
+                alt_text=$(echo "$image_link" | sed -n 's/.*!\[\([^]]*\)\].*/\1/p')
+
+                # Debug output to understand why replacement is not working
+                # Use Python3 for robust string replacement that handles special characters
+                if command -v python3 >/dev/null 2>&1; then
+                    if [[ -n "$alt_text" ]]; then
+                        processed_content=$(python3 -c "import sys; content=sys.stdin.read(); old=r'$image_link'; new=r'![$alt_text]($final_url)'; print(content.replace(old, new), end='')" <<< "$processed_content")
+                    else
+                        processed_content=$(python3 -c "import sys; content=sys.stdin.read(); old=r'$image_link'; new=r'![Image]($final_url)'; print(content.replace(old, new), end='')" <<< "$processed_content")
+                    fi
+                else
+                    # Fall back to bash (may not work with special chars)
+                    if [[ -n "$alt_text" ]]; then
+                        processed_content="${processed_content//$image_link/![$alt_text]($final_url)}"
+                    else
+                        processed_content="${processed_content//$image_link/![Image]($final_url)}"
+                    fi
+                fi                
+                log_verbose "Replaced attachment: $image_link -> $final_url"
+            else
+                log_error "Failed to get final URL for attachment: $filename"
+            fi
+        fi
+    done <<< "$attachments"
+
+    
+    echo "$processed_content"
+}
+
+# Validate that all local attachment links have been replaced with external URLs
+att_validate_content_replacement() {
+    local content="$1"
+    local source_dir="$2"
+    
+    log_verbose "Validating attachment link replacement..."
+    
+    # Find all attachment references in the content
+    local attachments
+    attachments=$(att_find_attachments_in_content "$content")
+    
+    if [[ -z "$attachments" ]]; then
+        log_verbose "No attachments found in content - validation passed"
+        return 0
+    fi
+    
+    # Check each attachment to see if it's still a local path
+    while IFS= read -r image_link; do
+        if [[ -n "$image_link" ]]; then
+            # Extract file path from the image link
+            local relative_path
+            relative_path=$(att_extract_file_path "$image_link")
+            
+            if [[ -n "$relative_path" ]]; then
+                # Check if this is still a local path (not an external URL)
+                if [[ "$relative_path" == attachments/* ]]; then
+                    log_error "Validation failed: Local attachment link still present: $image_link"
+                    log_error "Expected: External URL, Found: Local path"
+                    return 1
+                fi
+            fi
+        fi
+    done <<< "$attachments"
+    
+    log_verbose "All attachment links successfully replaced with external URLs"
+    return 0
+}
+
+# ATTACHMENT PROCESSING FUNCTIONS (Memory-based)
+# =============================================================================
 main() {
     for arg in "$@"; do
         if [[ "$arg" == "--help" ]]; then
@@ -776,11 +1184,8 @@ main() {
 
     api_test_connection
 
-    process_files
-
     url_init_mapping
 
-    REPLACE_LINKS="true"
     process_files
 
     log_info "✨ All documents created and updated"
