@@ -1450,13 +1450,33 @@ att_process_attachments_in_content() {
                 local alt_text
                 alt_text=$(echo "$image_link" | sed -n 's/.*!\[\([^]]*\)\].*/\1/p')
                 if [[ -n "$alt_text" ]]; then
-                    # Use perl for robust replacement that handles complex patterns
+                    # Use awk for robust replacement that handles complex patterns
                     local new_link="![$alt_text]($cached_url)"
-                    processed_content=$(echo "$processed_content" | perl -pe "s|\Q$image_link\E|$new_link|g")
+                    processed_content=$(echo "$processed_content" | awk -v old="$image_link" -v new="$new_link" '
+{
+    pos = index($0, old)
+    if (pos > 0) {
+        before = substr($0, 1, pos-1)
+        after = substr($0, pos + length(old))
+        print before new after
+    } else {
+        print $0
+    }
+}')
                 else
-                    # Use perl for robust replacement that handles complex patterns
+                    # Use awk for robust replacement that handles complex patterns
                     local new_link="![Image]($cached_url)"
-                    processed_content=$(echo "$processed_content" | perl -pe "s|\Q$image_link\E|$new_link|g")
+                    processed_content=$(echo "$processed_content" | awk -v old="$image_link" -v new="$new_link" '
+{
+    pos = index($0, old)
+    if (pos > 0) {
+        before = substr($0, 1, pos-1)
+        after = substr($0, pos + length(old))
+        print before new after
+    } else {
+        print $0
+    }
+}')
                 fi
                 continue
             fi
